@@ -1,6 +1,6 @@
 const CryptoJS = require('crypto-js');
 
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'default_key_change_this';
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a8f3k9x2m7p4q6w1r5t0y3u8i2o9e4n7';
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 🔐 ENCRYPT API CREDENTIALS
