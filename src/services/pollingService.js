@@ -248,6 +248,17 @@ class PollingService {
     }
   }
 
+  async isUserRegistered(username) {
+  const snapshot = await this.db.collection('users').get();
+  let found = false;
+  snapshot.forEach(doc => {
+    if (doc.data().username?.toLowerCase() === username.toLowerCase()) {
+      found = true;
+    }
+  });
+  return found;
+}
+
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 📋 PROCESS CREATED TASK CHANGES
   // Runs on the CREATOR's poll using CREATEDTASK endpoint.
@@ -291,6 +302,14 @@ class PollingService {
         // New task in CREATEDTASK not seen before — seed silently
         if (!prevTask) {
           console.log(`🌱 New created task seeded: ${task.TaskSubject}`);
+          continue;
+        }
+
+        // ✅ If assignee is registered, processTaskChanges already notified
+        // the creator via notifyTaskCreator — skip to avoid duplicate
+        const assigneeRegistered = await this.isUserRegistered(task.AssignToUserNm);
+        if (assigneeRegistered) {
+          console.log(`⏭️ Skipping created task check — assignee ${task.AssignToUserNm} is registered, already handled`);
           continue;
         }
 
