@@ -1,74 +1,66 @@
 const express = require('express');
 const router = express.Router();
 const { db } = require('../config/firebase');
-const { encryptCredentials } = require('../utils/encryption');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 📝 REGISTER USER WITH FCM TOKEN
+// 📝 REGISTER USER
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 router.post('/register', async (req, res) => {
   try {
-    const { api_credentials, fcm_token, platform, crm_user_id } = req.body; // ✅ Add crm_user_id
-    
+    const { api_credentials, fcm_token, platform, crm_user_id } = req.body;
+
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('📥 Received registration request');
+    console.log('📥 Registration request received');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('Request body:', JSON.stringify(req.body, null, 2));
-    
+
     if (!api_credentials || !fcm_token) {
-      console.log('❌ Missing required fields');
       return res.status(400).json({
         success: false,
         message: 'Missing required fields: api_credentials and fcm_token',
       });
     }
-    
+
     const { api_key, web_url, username, password } = api_credentials;
-    
+
     if (!web_url || !username || !password) {
-      console.log('❌ Incomplete API credentials');
       return res.status(400).json({
         success: false,
-        message: 'Incomplete API credentials',
+        message: 'Incomplete API credentials: web_url, username and password are required',
       });
     }
-    
-    // Create unique user ID
+
     const userId = `${web_url}_${username}`.replace(/[^a-zA-Z0-9]/g, '_');
     console.log(`📝 Registering user: ${username} (${userId})`);
-    
-    // Encrypt credentials
-    const encryptedCredentials = encryptCredentials({
+
+    // Store credentials as plain object — no encryption
+    const plainCredentials = {
       api_key: api_key || '',
       web_url,
       username,
       password,
-    });
-    
-    // Check if user exists
+    };
+
     const userDoc = await db.collection('users').doc(userId).get();
-    
+
     const userData = {
       username,
       web_url,
       fcm_token,
       platform: platform || 'unknown',
-      api_credentials: encryptedCredentials,
+      api_credentials: plainCredentials,
       updated_at: new Date().toISOString(),
     };
-    
-    // ✅ ADD CRM USER ID IF PROVIDED
+
     if (crm_user_id) {
       userData.crm_user_id = crm_user_id.toString();
       console.log(`📋 CRM User ID: ${crm_user_id}`);
     }
-    
+
     if (userDoc.exists) {
-      // Update existing user
+      // Update existing user — preserve all polling state fields
       await db.collection('users').doc(userId).update(userData);
-      
-      console.log(`✅ User ${username} updated successfully`);
-      
+      console.log(`✅ User ${username} updated`);
+
       return res.json({
         success: true,
         message: 'User updated successfully',
@@ -76,31 +68,42 @@ router.post('/register', async (req, res) => {
         is_new: false,
       });
     }
-    
-    // Create new user
+
+    // New user — initialise ALL fields the polling service expects.
+    // Missing fields cause first-run guards to misbehave and fire
+    // notifications on the very first poll.
     await db.collection('users').doc(userId).set({
       ...userData,
-      last_task_count: 0,
-      last_lead_count: 0,
-      task_data: {},
-      deadline_warnings_sent: {},
       created_at: new Date().toISOString(),
       last_checked: null,
+
+      // Assigned task tracking
+      task_data: {},
+      last_task_count: 0,
+      delayed_task_ids: [],
+      deadline_warnings_sent: {},
+
+      // Created task tracking (accepted / completed / delayed → to creator)
+      created_task_data: {},
+      created_delayed_task_ids: [],
+
+      // Lead tracking
+      known_lead_ids: [],
+      last_lead_count: 0,
+      follow_up_reminders_sent: {},
     });
-    
-    console.log(`✅ New user ${username} registered successfully`);
-    
+
+    console.log(`✅ New user ${username} registered`);
+
     return res.json({
       success: true,
       message: 'User registered successfully',
       user_id: userId,
       is_new: true,
     });
-    
+
   } catch (error) {
     console.error('❌ Registration error:', error);
-    console.error('Error stack:', error.stack);
-    
     return res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -124,12 +127,8 @@ router.post('/update-token', async (req, res) => {
     }
 
     const userDoc = await db.collection('users').doc(user_id).get();
-
     if (!userDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found',
-      });
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
     await db.collection('users').doc(user_id).update({
@@ -137,12 +136,8 @@ router.post('/update-token', async (req, res) => {
       updated_at: new Date().toISOString(),
     });
 
-    console.log(`✅ FCM token updated for user ${user_id}`);
-
-    return res.json({
-      success: true,
-      message: 'FCM token updated successfully',
-    });
+    console.log(`✅ FCM token updated for ${user_id}`);
+    return res.json({ success: true, message: 'FCM token updated successfully' });
 
   } catch (error) {
     console.error('❌ Token update error:', error);
@@ -155,7 +150,7 @@ router.post('/update-token', async (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 🗑️ DELETE USER / LOGOUT
+// 🗑️ LOGOUT (soft delete — clears FCM token only)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 router.post('/logout', async (req, res) => {
   try {
@@ -169,26 +164,17 @@ router.post('/logout', async (req, res) => {
     }
 
     const userDoc = await db.collection('users').doc(user_id).get();
-
     if (!userDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found',
-      });
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    // Remove FCM token (soft delete - keep user data)
     await db.collection('users').doc(user_id).update({
       fcm_token: null,
       logged_out_at: new Date().toISOString(),
     });
 
-    console.log(`✅ User ${user_id} logged out successfully`);
-
-    return res.json({
-      success: true,
-      message: 'Logged out successfully',
-    });
+    console.log(`✅ User ${user_id} logged out`);
+    return res.json({ success: true, message: 'Logged out successfully' });
 
   } catch (error) {
     console.error('❌ Logout error:', error);
@@ -206,31 +192,26 @@ router.post('/logout', async (req, res) => {
 router.get('/status/:user_id', async (req, res) => {
   try {
     const { user_id } = req.params;
-
     const userDoc = await db.collection('users').doc(user_id).get();
 
     if (!userDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found',
-      });
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    const userData = userDoc.data();
-
+    const d = userDoc.data();
     return res.json({
       success: true,
       user: {
         user_id,
-        username: userData.username,
-        web_url: userData.web_url,
-        platform: userData.platform,
-        has_fcm_token: !!userData.fcm_token,
-        last_task_count: userData.last_task_count,
-        last_lead_count: userData.last_lead_count,
-        last_checked: userData.last_checked,
-        created_at: userData.created_at,
-        updated_at: userData.updated_at,
+        username: d.username,
+        web_url: d.web_url,
+        platform: d.platform,
+        has_fcm_token: !!d.fcm_token,
+        last_task_count: d.last_task_count,
+        last_lead_count: d.last_lead_count,
+        last_checked: d.last_checked,
+        created_at: d.created_at,
+        updated_at: d.updated_at,
       },
     });
 
@@ -245,51 +226,31 @@ router.get('/status/:user_id', async (req, res) => {
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 🔍 DEBUG: LIST ALL USERS (TEMPORARY - REMOVE IN PRODUCTION)
+// 🔍 DEBUG: LIST ALL USERS (remove in production)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 router.get('/debug/list-all', async (req, res) => {
   try {
     const usersSnapshot = await db.collection('users').get();
-    
     const users = [];
+
     usersSnapshot.forEach(doc => {
-      const data = doc.data();
+      const d = doc.data();
       users.push({
         firebase_id: doc.id,
-        username: data.username,
-        web_url: data.web_url,
-        crm_user_id: data.crm_user_id || 'NOT SET',
-        has_fcm_token: !!data.fcm_token,
-        created_at: data.created_at,
+        username: d.username,
+        web_url: d.web_url,
+        crm_user_id: d.crm_user_id || 'NOT SET',
+        has_fcm_token: !!d.fcm_token,
+        created_at: d.created_at,
       });
     });
-    
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('📋 ALL REGISTERED USERS:');
-    users.forEach((user, index) => {
-      console.log(`\n${index + 1}. Firebase ID: ${user.firebase_id}`);
-      console.log(`   Username: ${user.username}`);
-      console.log(`   Web URL: ${user.web_url}`);
-      console.log(`   CRM User ID: ${user.crm_user_id}`);
-      console.log(`   Has FCM Token: ${user.has_fcm_token}`);
-    });
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    
-    return res.json({
-      success: true,
-      total_users: users.length,
-      users: users,
-    });
+
+    return res.json({ success: true, total_users: users.length, users });
+
   } catch (error) {
     console.error('❌ Error listing users:', error);
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
-
-
-
 
 module.exports = router;
