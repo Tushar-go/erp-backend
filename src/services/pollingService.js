@@ -14,20 +14,19 @@ class PollingService {
     this.intervalId = null;
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 🚀 START / STOP
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   start() {
     if (this.isRunning) {
       console.log('⚠️ Polling service already running');
       return;
     }
     const interval = parseInt(process.env.POLLING_INTERVAL || 60000);
-    console.log(`🚀 Starting polling service — interval: ${interval / 1000}s`);
+    console.log(`🚀 Starting polling service - interval: ${interval}ms (${interval / 1000}s)`);
     this.pollAllUsers();
-    this.intervalId = setInterval(() => this.pollAllUsers(), interval);
+    this.intervalId = setInterval(() => {
+      this.pollAllUsers();
+    }, interval);
     this.isRunning = true;
-    console.log('✅ Polling service started');
+    console.log('✅ Polling service started successfully');
   }
 
   stop() {
@@ -43,78 +42,63 @@ class PollingService {
     console.log('⏹️ Polling service stopped');
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 🔄 POLL ALL USERS
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   async pollAllUsers() {
     try {
       console.log('🔄 Polling all users...');
       const usersSnapshot = await this.db.collection('users').get();
-
       if (usersSnapshot.empty) {
         console.log('⚠️ No users registered yet');
         return;
       }
-
       console.log(`👥 Found ${usersSnapshot.size} registered user(s)`);
-
       const promises = [];
-      usersSnapshot.forEach(doc => promises.push(this.pollUser(doc.id)));
+      usersSnapshot.forEach(doc => {
+        promises.push(this.pollUser(doc.id, doc.data()));
+      });
       await Promise.allSettled(promises);
-
       console.log('✅ Polling cycle complete');
     } catch (error) {
       console.error('❌ Error polling users:', error);
     }
   }
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 👤 POLL SINGLE USER
-  // Always reads fresh Firestore data — snapshot may be stale
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  async pollUser(userId) {
+  async pollUser(userId, userData) {
     try {
+      // Always read fresh data from Firestore — snapshot may be stale mid-cycle
       const freshDoc = await this.db.collection('users').doc(userId).get();
       const freshData = freshDoc.data();
 
-      const { fcm_token, api_credentials } = freshData;
+      const { fcm_token, api_credentials, username } = freshData;
 
+      if (!fcm_token) {
+        console.log(`⚠️ User ${userId} has no FCM token`);
+        return;
+      }
       if (!api_credentials) {
         console.log(`⚠️ User ${userId} has no API credentials`);
         return;
       }
 
-      if (!fcm_token) {
-        console.log(`⚠️ User ${userId} has no FCM token — skipping`);
-        return;
-      }
-
       // Fetch ASSIGNEDTASK, CREATEDTASK, ASSIGNEDLEAD in parallel
-      const [assignedTasks, createdTasks, leads] = await Promise.all([
+      const [tasks, createdTasks, leads] = await Promise.all([
         thirdPartyService.fetchAssignedTasks(api_credentials).catch(err => {
-          console.error(`❌ fetchAssignedTasks for ${userId}:`, err.message);
-          return null;
+          console.error(`❌ Error fetching assigned tasks for ${userId}:`, err.message);
+          return [];
         }),
         thirdPartyService.fetchCreatedTasks(api_credentials).catch(err => {
-          console.error(`❌ fetchCreatedTasks for ${userId}:`, err.message);
-          return null;
+          console.error(`❌ Error fetching created tasks for ${userId}:`, err.message);
+          return [];
         }),
         thirdPartyService.fetchAssignedLeads(api_credentials).catch(err => {
-          console.error(`❌ fetchAssignedLeads for ${userId}:`, err.message);
-          return null;
+          console.error(`❌ Error fetching leads for ${userId}:`, err.message);
+          return [];
         }),
       ]);
 
-      // Process each independently — one failing doesn't block others
-      if (assignedTasks !== null) {
-        await this.processAssignedTaskChanges(userId, freshData, assignedTasks, fcm_token);
-      }
-      if (createdTasks !== null) {
-        await this.processCreatedTaskChanges(userId, freshData, createdTasks, fcm_token);
-      }
-      if (leads !== null) {
-        await this.processLeadChanges(userId, freshData, leads, fcm_token);
-      }
+      // Pass freshData, not the stale userData from the snapshot
+      await this.processTaskChanges(userId, freshData, tasks, fcm_token);
+      await this.processCreatedTaskChanges(userId, freshData, createdTasks, fcm_token);
+      await this.processLeadChanges(userId, freshData, leads, fcm_token);
 
       await this.db.collection('users').doc(userId).update({
         last_checked: new Date().toISOString(),
@@ -142,20 +126,28 @@ class PollingService {
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 📋 PROCESS ASSIGNED TASKS (notifications TO the assignee)
+  // 📋 PROCESS ASSIGNED TASK CHANGES
+  // Notifications TO the assignee (this user):
   //   • New task assigned
   //   • Deadline warning 1 hour before
   //   • Task delayed (past deadline) — fires once
+  // Notifications TO the creator (via notifyTaskCreator):
+  //   • Task accepted
+  //   • Task completed
+  //   • Task delayed
+  // NOTE: accepted/completed/delayed to creator here only works if
+  // the assignee is registered. For unregistered assignees, these
+  // are handled by processCreatedTaskChanges on the creator's poll.
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  async processAssignedTaskChanges(userId, userData, currentTasks, fcmToken) {
+  async processTaskChanges(userId, userData, currentTasks, fcmToken) {
     try {
       const { username } = userData;
       const prevTaskData = userData.task_data || {};
+
       const delayedTaskIds = new Set(
         (userData.delayed_task_ids || []).map(id => id.toString())
       );
 
-      // Build current snapshot using statusId
       const currentTaskData = {};
       currentTasks.forEach(task => {
         currentTaskData[task.DocID] = {
@@ -165,21 +157,10 @@ class PollingService {
         };
       });
 
-      // First run — seed silently, no notifications
-      if (Object.keys(prevTaskData).length === 0 && currentTasks.length > 0) {
-        console.log(`🌱 Seeding assigned tasks for ${username} (${currentTasks.length}) — no notifications`);
-        await this.db.collection('users').doc(userId).update({
-          task_data: currentTaskData,
-          last_task_count: currentTasks.length,
-          delayed_task_ids: [],
-        });
-        return;
-      }
-
       // ── NEW TASKS ───────────────────────────────────────────────
       const newTasks = currentTasks.filter(task => !prevTaskData[task.DocID]);
       if (newTasks.length > 0) {
-        console.log(`🆕 ${newTasks.length} new assigned task(s) for ${username}`);
+        console.log(`🆕 ${newTasks.length} new task(s) for ${username}`);
         const result = await this.notificationService.sendTaskNotification(
           fcmToken, newTasks, newTasks.length
         );
@@ -189,38 +170,70 @@ class PollingService {
         }
       }
 
-      // ── DEADLINE CHECKS ─────────────────────────────────────────
+      // ── STATUS CHANGES & DEADLINE CHECKS ───────────────────────
       for (const task of currentTasks) {
-        if (!prevTaskData[task.DocID]) continue; // new task, skip deadline check
+        const prevTask = prevTaskData[task.DocID];
+        if (!prevTask) continue;
 
-        const currentStatusId = task.TaskStatusID;
+        const prevStatus = prevTask.status;
+        const currentStatus = task.TaskStatus;
 
-        // Completed — clean up delayed set
-        if (currentStatusId === 2) {
-          delayedTaskIds.delete(task.DocID.toString());
-          continue;
+        if (prevStatus !== currentStatus) {
+          console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+          console.log(`🔄 Status change: ${task.TaskSubject}`);
+          console.log(`   "${prevStatus}" → "${currentStatus}"`);
+          console.log(`   Creator: ${task.CreateUserNm}`);
+          console.log(`   Assigned: ${task.AssignToUserNm}`);
+          console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         }
 
+        // Task Accepted: StatusID 0 → 1
+        if (prevTask.statusId === 0 && task.TaskStatusID === 1) {
+          console.log(`✅ Task accepted: ${task.TaskSubject}`);
+          await this.notifyTaskCreator(task, 'accepted');
+        }
+
+        // Task Completed: any → StatusID 2
+        if (task.TaskStatusID === 2 && prevTask.statusId !== 2) {
+          console.log(`✅ Task completed: ${task.TaskSubject}`);
+          await this.notifyTaskCreator(task, 'completed');
+        }
+
+        // ── DEADLINE CHECKS ────────────────────────────────────────
         const now = this.getISTDate();
         const deadline = this.getISTDate(task.TaskDeadline);
+        const deadlinePassed = now > deadline;
 
-        // Deadline warning — 1 hour before, fires once per task
-        const oneHourBefore = new Date(deadline.getTime() - 60 * 60 * 1000);
-        if (now >= oneHourBefore && now < deadline) {
-          await this.checkDeadlineWarning(userId, task, fcmToken);
-        }
-
-        // Delayed — past deadline, not completed, fires once
-        if (now > deadline && !delayedTaskIds.has(task.DocID.toString())) {
-          console.log(`🚨 Assigned task delayed: ${task.TaskSubject}`);
-          const result = await this.notificationService.sendTaskDelayedNotification(
-            fcmToken, task, false
-          );
-          if (result && result.error === 'invalid_token') {
-            await this.handleInvalidToken(userId);
-            return;
+        if (task.TaskStatusID !== 2) {
+          // Deadline warning: 1 hour before
+          const oneHourBefore = new Date(deadline.getTime() - 60 * 60 * 1000);
+          if (now >= oneHourBefore && now < deadline) {
+            await this.checkDeadlineWarning(userId, task, fcmToken);
           }
-          delayedTaskIds.add(task.DocID.toString());
+
+          // Delayed — fires once per task
+          if (deadlinePassed && !delayedTaskIds.has(task.DocID.toString())) {
+            console.log(`🚨 Deadline passed for task: ${task.TaskSubject}`);
+            console.log(`   Deadline: ${deadline.toISOString()}`);
+            console.log(`   Now: ${now.toISOString()}`);
+
+            // Notify assignee
+            const result1 = await this.notificationService.sendTaskDelayedNotification(
+              fcmToken, task, false
+            );
+            if (result1 && result1.error === 'invalid_token') {
+              await this.handleInvalidToken(userId);
+              return;
+            }
+
+            // Notify creator
+            await this.notifyTaskCreator(task, 'delayed');
+
+            delayedTaskIds.add(task.DocID.toString());
+          }
+        } else {
+          // Task completed — clean up delayed set
+          delayedTaskIds.delete(task.DocID.toString());
         }
       }
 
@@ -231,18 +244,19 @@ class PollingService {
       });
 
     } catch (error) {
-      console.error(`❌ Error processing assigned tasks for ${userId}:`, error);
+      console.error(`❌ Error processing tasks for ${userId}:`, error);
     }
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 📋 PROCESS CREATED TASKS (notifications TO the creator)
-  //   • Task accepted  — StatusID 0 → 1
-  //   • Task completed — any → StatusID 2 (broad: handles delayed edge case)
-  //   • Task delayed   — past deadline, StatusID !== 2, fires once
-  //
+  // 📋 PROCESS CREATED TASK CHANGES
   // Runs on the CREATOR's poll using CREATEDTASK endpoint.
-  // Assignee does NOT need to be a registered user.
+  // Handles the case where the assignee is NOT a registered user —
+  // the creator's own poll detects status changes and notifies them.
+  // Notifications TO the creator:
+  //   • Task accepted  (StatusID 0 → 1)
+  //   • Task completed (any → StatusID 2)
+  //   • Task delayed   (past deadline, fires once)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   async processCreatedTaskChanges(userId, userData, currentTasks, fcmToken) {
     try {
@@ -252,7 +266,6 @@ class PollingService {
         (userData.created_delayed_task_ids || []).map(id => id.toString())
       );
 
-      // Build current snapshot using statusId
       const currentCreatedTaskData = {};
       currentTasks.forEach(task => {
         currentCreatedTaskData[task.DocID] = {
@@ -275,7 +288,7 @@ class PollingService {
       for (const task of currentTasks) {
         const prevTask = prevCreatedTaskData[task.DocID];
 
-        // Task not seen before — seed it silently, no notification
+        // New task in CREATEDTASK not seen before — seed silently
         if (!prevTask) {
           console.log(`🌱 New created task seeded: ${task.TaskSubject}`);
           continue;
@@ -285,7 +298,7 @@ class PollingService {
         const currentStatusId = task.TaskStatusID;
 
         if (prevStatusId !== currentStatusId) {
-          console.log(`🔄 Created task status change: ${prevStatusId} → ${currentStatusId} | ${task.TaskSubject}`);
+          console.log(`🔄 Created task status: ${prevStatusId} → ${currentStatusId} | ${task.TaskSubject} | Assignee: ${task.AssignToUserNm}`);
         }
 
         // ✅ ACCEPTED — StatusID 0 → 1
@@ -301,8 +314,8 @@ class PollingService {
         }
 
         // ✅ COMPLETED — any → StatusID 2
-        // Broad check covers edge case where prevStatusId was stored
-        // with a custom value (e.g. from a delayed state mismatch)
+        // Broad check covers edge case where prevStatusId was not 1
+        // (e.g. task was past deadline but then completed)
         if (currentStatusId === 2 && prevStatusId !== 2) {
           console.log(`✅ Task completed by ${task.AssignToUserNm}: ${task.TaskSubject}`);
           const result = await this.notificationService.sendTaskCompletedNotification(
@@ -312,9 +325,8 @@ class PollingService {
             await this.handleInvalidToken(userId);
             return;
           }
-          // Clean up delayed tracking since task is now done
           createdDelayedTaskIds.delete(task.DocID.toString());
-          continue; // no need to check delayed below
+          continue;
         }
 
         // ✅ DELAYED — past deadline, not completed, fires once
@@ -322,7 +334,7 @@ class PollingService {
           const now = this.getISTDate();
           const deadline = this.getISTDate(task.TaskDeadline);
           if (now > deadline && !createdDelayedTaskIds.has(task.DocID.toString())) {
-            console.log(`🚨 Created task delayed: ${task.TaskSubject}`);
+            console.log(`🚨 Created task delayed: ${task.TaskSubject} | Assignee: ${task.AssignToUserNm}`);
             const result = await this.notificationService.sendTaskDelayedNotification(
               fcmToken, task, true // isCreator = true
             );
@@ -346,14 +358,13 @@ class PollingService {
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // ⏰ DEADLINE WARNING — fires once per task per assignee
+  // ⏰ DEADLINE WARNING — fires once per task
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   async checkDeadlineWarning(userId, task, fcmToken) {
     try {
       const userDoc = await this.db.collection('users').doc(userId).get();
       const userData = userDoc.data();
       const warningsSent = userData.deadline_warnings_sent || {};
-
       if (!warningsSent[task.DocID]) {
         console.log(`⏰ Deadline warning: ${task.TaskSubject}`);
         const result = await this.notificationService.sendDeadlineWarningNotification(
@@ -374,9 +385,73 @@ class PollingService {
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 🔔 NOTIFY TASK CREATOR (searches Firestore by username)
+  // Used by processTaskChanges when the assignee IS registered —
+  // finds and notifies the creator directly from Firestore.
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  async notifyTaskCreator(task, notificationType) {
+    try {
+      const creatorUsername = task.CreateUserNm;
+      console.log(`🔍 Looking for creator: "${creatorUsername}"`);
+
+      const allUsersSnapshot = await this.db.collection('users').get();
+      const matchingUsers = [];
+      allUsersSnapshot.forEach(doc => {
+        const userData = doc.data();
+        if (userData.username &&
+            userData.username.toLowerCase() === creatorUsername.toLowerCase()) {
+          matchingUsers.push({ id: doc.id, data: userData });
+        }
+      });
+
+      if (matchingUsers.length === 0) {
+        console.log(`⚠️ Creator "${creatorUsername}" not registered — will be handled by CREATEDTASK poll`);
+        return;
+      }
+
+      console.log(`✅ Found creator: ${creatorUsername}`);
+
+      for (const user of matchingUsers) {
+        if (!user.data.fcm_token) {
+          console.log(`⚠️ No FCM token for ${user.data.username}`);
+          continue;
+        }
+
+        console.log(`📤 Sending ${notificationType} notification to creator`);
+
+        let result;
+        switch (notificationType) {
+          case 'accepted':
+            result = await this.notificationService.sendTaskAcceptedNotification(
+              user.data.fcm_token, task
+            );
+            break;
+          case 'completed':
+            result = await this.notificationService.sendTaskCompletedNotification(
+              user.data.fcm_token, task
+            );
+            break;
+          case 'delayed':
+            result = await this.notificationService.sendTaskDelayedNotification(
+              user.data.fcm_token, task, true
+            );
+            break;
+        }
+
+        if (result && result.error === 'invalid_token') {
+          await this.handleInvalidToken(user.id);
+        } else {
+          console.log(`✅ Notification sent to ${user.data.username}`);
+        }
+      }
+    } catch (error) {
+      console.error(`❌ Error notifying creator:`, error);
+    }
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 🎯 PROCESS LEAD CHANGES
-  //   • New lead allotment (DocID-based)
-  //   • Follow-up reminders (LeadFollowUpDt == today IST, once per day)
+  // New lead allotment (DocID-based) + follow-up reminders
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   async processLeadChanges(userId, userData, currentLeads, fcmToken) {
     try {
@@ -397,16 +472,6 @@ class PollingService {
         )
       );
 
-      // First run — seed silently, no notification
-      if (prevKnownIds.length === 0 && currentLeads.length > 0) {
-        console.log(`🌱 Seeding leads for ${username} (${currentLeads.length}) — no notifications`);
-        await this.db.collection('users').doc(userId).update({
-          known_lead_ids: currentLeadIds,
-        });
-        return;
-      }
-
-      // ── NEW LEADS ──────────────────────────────────────────────
       const newLeads = currentLeads.filter(
         lead => !prevLeadIdSet.has(Number(lead.DocID))
       );
@@ -445,7 +510,6 @@ class PollingService {
         reminderFired = true;
       }
 
-      // Single atomic write
       const updatePayload = { known_lead_ids: currentLeadIds };
       if (reminderFired) updatePayload.follow_up_reminders_sent = updatedReminderLog;
       await this.db.collection('users').doc(userId).update(updatePayload);
@@ -460,12 +524,12 @@ class PollingService {
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   async handleInvalidToken(userId) {
     try {
-      console.log(`🗑️ Removing invalid FCM token for ${userId}`);
+      console.log(`🗑️ Removing invalid FCM token for user ${userId}`);
       await this.db.collection('users').doc(userId).update({
         fcm_token: null,
         token_invalidated_at: new Date().toISOString(),
       });
-      console.log(`✅ Invalid token removed for ${userId}`);
+      console.log(`✅ Invalid token removed for user ${userId}`);
     } catch (error) {
       console.error(`❌ Error handling invalid token for ${userId}:`, error);
     }
