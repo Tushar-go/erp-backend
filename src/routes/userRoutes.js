@@ -1,9 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const { db } = require('../config/firebase');
+const thirdPartyService = require('../services/thirdPartyService');
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📝 REGISTER USER
+// Validates credentials against CRM AUTH endpoint before saving.
+// Returns 401 with the CRM's exact error message if auth fails
+// so the app can display "Invalid UserID." / "Invalid User PW."
+// directly to the user.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 router.post('/register', async (req, res) => {
   try {
@@ -29,10 +34,26 @@ router.post('/register', async (req, res) => {
       });
     }
 
+    // ── VALIDATE CREDENTIALS AGAINST CRM ──────────────────────
+    console.log(`🔐 Validating credentials for ${username}...`);
+    const authResult = await thirdPartyService.validateCredentials(api_credentials);
+
+    if (!authResult.valid) {
+      console.log(`❌ Auth failed for ${username}: ${authResult.message}`);
+      return res.status(401).json({
+        success: false,
+        // CRM message passed through directly:
+        // "Invalid UserID." or "Invalid User PW."
+        message: authResult.message,
+      });
+    }
+
+    console.log(`✅ Credentials valid for ${username}`);
+    // ──────────────────────────────────────────────────────────
+
     const userId = `${web_url}_${username}`.replace(/[^a-zA-Z0-9]/g, '_');
     console.log(`📝 Registering user: ${username} (${userId})`);
 
-    // Store credentials as plain object — no encryption
     const plainCredentials = {
       api_key: api_key || '',
       web_url,
@@ -60,7 +81,6 @@ router.post('/register', async (req, res) => {
       // Update existing user — preserve all polling state fields
       await db.collection('users').doc(userId).update(userData);
       console.log(`✅ User ${username} updated`);
-
       return res.json({
         success: true,
         message: 'User updated successfully',
@@ -70,23 +90,19 @@ router.post('/register', async (req, res) => {
     }
 
     // New user — initialise ALL fields the polling service expects.
-    // Missing fields cause first-run guards to misbehave and fire
-    // notifications on the very first poll.
+    // Missing fields cause first-run guards to misbehave.
     await db.collection('users').doc(userId).set({
       ...userData,
       created_at: new Date().toISOString(),
       last_checked: null,
-
       // Assigned task tracking
       task_data: {},
       last_task_count: 0,
       delayed_task_ids: [],
       deadline_warnings_sent: {},
-
       // Created task tracking (accepted / completed / delayed → to creator)
       created_task_data: {},
       created_delayed_task_ids: [],
-
       // Lead tracking
       known_lead_ids: [],
       last_lead_count: 0,
@@ -94,14 +110,12 @@ router.post('/register', async (req, res) => {
     });
 
     console.log(`✅ New user ${username} registered`);
-
     return res.json({
       success: true,
       message: 'User registered successfully',
       user_id: userId,
       is_new: true,
     });
-
   } catch (error) {
     console.error('❌ Registration error:', error);
     return res.status(500).json({
@@ -138,7 +152,6 @@ router.post('/update-token', async (req, res) => {
 
     console.log(`✅ FCM token updated for ${user_id}`);
     return res.json({ success: true, message: 'FCM token updated successfully' });
-
   } catch (error) {
     console.error('❌ Token update error:', error);
     return res.status(500).json({
@@ -175,7 +188,6 @@ router.post('/logout', async (req, res) => {
 
     console.log(`✅ User ${user_id} logged out`);
     return res.json({ success: true, message: 'Logged out successfully' });
-
   } catch (error) {
     console.error('❌ Logout error:', error);
     return res.status(500).json({
@@ -214,7 +226,6 @@ router.get('/status/:user_id', async (req, res) => {
         updated_at: d.updated_at,
       },
     });
-
   } catch (error) {
     console.error('❌ Status check error:', error);
     return res.status(500).json({
@@ -222,34 +233,6 @@ router.get('/status/:user_id', async (req, res) => {
       message: 'Internal server error',
       error: error.message,
     });
-  }
-});
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 🔍 DEBUG: LIST ALL USERS (remove in production)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-router.get('/debug/list-all', async (req, res) => {
-  try {
-    const usersSnapshot = await db.collection('users').get();
-    const users = [];
-
-    usersSnapshot.forEach(doc => {
-      const d = doc.data();
-      users.push({
-        firebase_id: doc.id,
-        username: d.username,
-        web_url: d.web_url,
-        crm_user_id: d.crm_user_id || 'NOT SET',
-        has_fcm_token: !!d.fcm_token,
-        created_at: d.created_at,
-      });
-    });
-
-    return res.json({ success: true, total_users: users.length, users });
-
-  } catch (error) {
-    console.error('❌ Error listing users:', error);
-    return res.status(500).json({ success: false, error: error.message });
   }
 });
 

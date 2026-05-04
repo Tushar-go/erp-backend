@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(find c:/Users/Dhalwal/Projects/Erp/android/app -name *.java -o -name *.kt)"
-    ]
-  }
-}

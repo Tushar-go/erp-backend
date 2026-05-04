@@ -5,4 +5,4 @@ firebase-service-account.json
 .DS_Store
 dist/
 build/
-.claude
+.claude/
